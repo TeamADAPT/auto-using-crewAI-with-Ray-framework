@@ -4,7 +4,6 @@ import pandas as pd
 import os
 from typing import List, Dict, Tuple
 from crewai import Agent, Task, Crew
-from .ray_executor import RayExecutor
 from langchain_openai import ChatOpenAI
 
 class BenchmarkMetrics:
@@ -14,31 +13,77 @@ class BenchmarkMetrics:
             'tasks_completed': [],
             'execution_type': [],
             'timestamp': [],
-            'memory_usage': [],
-            'cpu_usage': []
+            'cpu_percent': []  # Simplified metrics
         }
     
-    def add_metric(self, exec_time: float, tasks: int, exec_type: str,
-                  memory: float, cpu: float):
+    def add_metric(self, exec_time: float, tasks: int, exec_type: str):
+        """Add metrics without trying to access unavailable memory data"""
         self.metrics['execution_time'].append(exec_time)
         self.metrics['tasks_completed'].append(tasks)
         self.metrics['execution_type'].append(exec_type)
         self.metrics['timestamp'].append(time.time())
-        self.metrics['memory_usage'].append(memory)
-        self.metrics['cpu_usage'].append(cpu)
+        # Get available CPU metrics from Ray
+        try:
+            resources = ray.available_resources()
+            cpu_usage = 1.0 - (resources.get('CPU', 0) / ray.cluster_resources()['CPU'])
+            self.metrics['cpu_percent'].append(cpu_usage * 100)
+        except Exception:
+            self.metrics['cpu_percent'].append(0.0)
     
     def to_dataframe(self) -> pd.DataFrame:
         return pd.DataFrame(self.metrics)
+
+@ray.remote
+class RayAgent:
+    """Ray Actor wrapper for CrewAI agents"""
+    def __init__(self, agent_config: Dict):
+        # Configure OpenAI for distributed agent
+        self.llm = ChatOpenAI(
+            model="gpt-3.5-turbo",
+            temperature=0.7,
+            request_timeout=30,
+            max_retries=3
+        )
+        agent_config['llm'] = self.llm
+        self.agent = Agent(**agent_config)
+        
+    def execute_task(self, task: Task) -> str:
+        return self.agent.execute(task)
+
+class RayExecutor:
+    """Handles distributed execution of CrewAI workflows using Ray"""
+    
+    def __init__(self):
+        if not ray.is_initialized():
+            ray.init()
+            
+    def create_agents(self, agent_configs: List[Dict]) -> List[RayAgent]:
+        """Create Ray agent actors from configurations"""
+        return [RayAgent.remote(config) for config in agent_configs]
+    
+    def execute_tasks(self, agents: List[RayAgent], tasks: List[Task]) -> List[str]:
+        """Execute tasks in parallel using Ray"""
+        futures = []
+        for agent, task in zip(agents, tasks):
+            futures.append(agent.execute_task.remote(task))
+        return ray.get(futures)
+    
+    def shutdown(self):
+        """Clean up Ray resources"""
+        if ray.is_initialized():
+            ray.shutdown()
 
 class Benchmark:
     def __init__(self):
         self.metrics = BenchmarkMetrics()
         self.ray_executor = RayExecutor()
         
-        # Configure default LLM
+        # Configure OpenAI LLM
         self.llm = ChatOpenAI(
             model="gpt-3.5-turbo",
             temperature=0.7,
+            request_timeout=30,
+            max_retries=3
         )
     
     def create_agents_and_tasks(self, agent_configs: List[Dict]) -> Tuple[List[Agent], List[Task]]:
@@ -89,7 +134,7 @@ class Benchmark:
         return results, exec_time
     
     def run_distributed(self, agent_configs: List[Dict]) -> Tuple[List[str], float]:
-        """Run tasks in parallel using Ray and measure performance"""
+        """Run tasks in parallel using Ray"""
         start_time = time.time()
         ray_agents = self.ray_executor.create_agents(agent_configs)
         _, tasks = self.create_agents_and_tasks(agent_configs)
@@ -107,9 +152,9 @@ class Benchmark:
                 print("Running sequential execution...")
                 _, seq_time = self.run_sequential(agent_configs)
                 self.metrics.add_metric(
-                    seq_time, len(agent_configs), 'sequential',
-                    ray.runtime_context.get_runtime_context().get_memory_usage(),
-                    ray.runtime_context.get_runtime_context().get_cpu_usage()
+                    seq_time, 
+                    len(agent_configs), 
+                    'sequential'
                 )
                 print(f"Sequential execution completed in {seq_time:.2f} seconds")
             except Exception as e:
@@ -121,9 +166,9 @@ class Benchmark:
                 print("Running distributed execution...")
                 _, dist_time = self.run_distributed(agent_configs)
                 self.metrics.add_metric(
-                    dist_time, len(agent_configs), 'distributed',
-                    ray.runtime_context.get_runtime_context().get_memory_usage(),
-                    ray.runtime_context.get_runtime_context().get_cpu_usage()
+                    dist_time, 
+                    len(agent_configs), 
+                    'distributed'
                 )
                 print(f"Distributed execution completed in {dist_time:.2f} seconds")
             except Exception as e:
@@ -134,18 +179,8 @@ class Benchmark:
 
 def run():
     """CLI entry point for running benchmarks"""
-    # Check for OpenAI API key
-    if not os.getenv('OPENAI_API_KEY'):
-        print("Error: OPENAI_API_KEY environment variable is not set.")
-        print("Please set your OpenAI API key first:")
-        print("export OPENAI_API_KEY='your-api-key-here'")
-        return
-        
-    from .utils.metrics import MetricsCollector
-    
     # Initialize benchmark and metrics collector
     benchmark = Benchmark()
-    metrics_collector = MetricsCollector()
     
     # Define benchmark configurations with more specific agent parameters
     agent_configs = [
@@ -201,24 +236,24 @@ def run():
         print("No successful benchmark runs completed.")
         return
         
-    # Calculate statistics and generate visualizations
-    stats = metrics_collector.calculate_statistics(all_results)
-    scaling_efficiency = metrics_collector.calculate_scaling_efficiency(all_results)
+    # Calculate and print summary statistics
+    sequential_times = all_results[all_results['execution_type'] == 'sequential']['execution_time']
+    distributed_times = all_results[all_results['execution_type'] == 'distributed']['execution_time']
     
-    # Save results
-    save_paths = metrics_collector.save_results(all_results, stats)
-    
-    # Print summary
     print("\nBenchmark Results Summary:")
     print("-" * 50)
-    print(f"Scaling Efficiency: {scaling_efficiency:.2f}")
-    print("\nMean Execution Times:")
-    print(f"Sequential: {stats['sequential']['mean_time']:.2f} seconds")
-    print(f"Distributed: {stats['distributed']['mean_time']:.2f} seconds")
-    print("\nResource Usage (average):")
-    print(f"Sequential - Memory: {stats['sequential']['mean_memory']:.1f}%, CPU: {stats['sequential']['mean_cpu']:.1f}%")
-    print(f"Distributed - Memory: {stats['distributed']['mean_memory']:.1f}%, CPU: {stats['distributed']['mean_cpu']:.1f}%")
+    print("\nExecution Times (seconds):")
+    print(f"Sequential  - Mean: {sequential_times.mean():.2f}, Min: {sequential_times.min():.2f}, Max: {sequential_times.max():.2f}")
+    print(f"Distributed - Mean: {distributed_times.mean():.2f}, Min: {distributed_times.min():.2f}, Max: {distributed_times.max():.2f}")
     
-    print("\nDetailed results saved to:")
-    for key, path in save_paths.items():
-        print(f"{key}: {path}")
+    speedup = sequential_times.mean() / distributed_times.mean()
+    print(f"\nAverage Speedup: {speedup:.2f}x")
+    
+    # Save results to CSV
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    results_file = f"benchmark_results_{timestamp}.csv"
+    all_results.to_csv(results_file, index=False)
+    print(f"\nDetailed results saved to: {results_file}")
+
+if __name__ == "__main__":
+    run()
