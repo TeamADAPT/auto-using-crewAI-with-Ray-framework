@@ -1,9 +1,11 @@
 import time
 import ray
 import pandas as pd
+import os
 from typing import List, Dict, Tuple
 from crewai import Agent, Task, Crew
 from .ray_executor import RayExecutor
+from langchain_openai import ChatOpenAI
 
 class BenchmarkMetrics:
     def __init__(self):
@@ -32,19 +34,52 @@ class Benchmark:
     def __init__(self):
         self.metrics = BenchmarkMetrics()
         self.ray_executor = RayExecutor()
+        
+        # Configure default LLM
+        self.llm = ChatOpenAI(
+            model="gpt-3.5-turbo",
+            temperature=0.7,
+        )
     
-    def run_sequential(self, agents: List[Dict], tasks: List[Task]) -> Tuple[List[str], float]:
+    def create_agents_and_tasks(self, agent_configs: List[Dict]) -> Tuple[List[Agent], List[Task]]:
+        """Create agents and tasks with proper assignments"""
+        # Add LLM configuration to each agent
+        agents = []
+        for config in agent_configs:
+            config['llm'] = self.llm  # Add LLM configuration
+            agents.append(Agent(**config))
+        
+        # Create tasks with assigned agents
+        tasks = [
+            Task(
+                description="Gather market research data for tech sector",
+                expected_output="Comprehensive market data report",
+                agent=agents[0]  # Assign to Researcher
+            ),
+            Task(
+                description="Analyze market trends and competition",
+                expected_output="Detailed analysis report",
+                agent=agents[1]  # Assign to Analyst
+            ),
+            Task(
+                description="Create executive summary of findings",
+                expected_output="Executive summary document",
+                agent=agents[2]  # Assign to Writer
+            )
+        ]
+        
+        return agents, tasks
+    
+    def run_sequential(self, agent_configs: List[Dict]) -> Tuple[List[str], float]:
         """Run tasks sequentially and measure performance"""
         start_time = time.time()
-        results = []
         
-        crew_agents = []
-        for agent_config in agents:
-            agent = Agent(**agent_config)
-            crew_agents.append(agent)
-            
+        # Create agents and tasks
+        agents, tasks = self.create_agents_and_tasks(agent_configs)
+        
+        # Create and run crew
         crew = Crew(
-            agents=crew_agents,
+            agents=agents,
             tasks=tasks,
             verbose=True
         )
@@ -53,52 +88,66 @@ class Benchmark:
         exec_time = time.time() - start_time
         return results, exec_time
     
-    def run_distributed(self, agents: List[Dict], tasks: List[Task]) -> Tuple[List[str], float]:
+    def run_distributed(self, agent_configs: List[Dict]) -> Tuple[List[str], float]:
         """Run tasks in parallel using Ray and measure performance"""
         start_time = time.time()
-        ray_agents = self.ray_executor.create_agents(agents)
+        ray_agents = self.ray_executor.create_agents(agent_configs)
+        _, tasks = self.create_agents_and_tasks(agent_configs)
         results = self.ray_executor.execute_tasks(ray_agents, tasks)
         exec_time = time.time() - start_time
         return results, exec_time
     
-    def compare_performance(self, agents: List[Dict], tasks: List[Task], iterations: int = 3):
+    def compare_performance(self, agent_configs: List[Dict], iterations: int = 3):
         """Compare sequential vs distributed performance"""
-        for _ in range(iterations):
+        for i in range(iterations):
+            print(f"\nIteration {i+1}/{iterations}")
+            
             # Sequential execution
             try:
-                _, seq_time = self.run_sequential(agents, tasks)
+                print("Running sequential execution...")
+                _, seq_time = self.run_sequential(agent_configs)
                 self.metrics.add_metric(
-                    seq_time, len(tasks), 'sequential',
+                    seq_time, len(agent_configs), 'sequential',
                     ray.runtime_context.get_runtime_context().get_memory_usage(),
                     ray.runtime_context.get_runtime_context().get_cpu_usage()
                 )
+                print(f"Sequential execution completed in {seq_time:.2f} seconds")
             except Exception as e:
-                print(f"Error in sequential execution: {e}")
+                print(f"Error in sequential execution: {str(e)}")
                 continue
                 
             # Distributed execution
             try:
-                _, dist_time = self.run_distributed(agents, tasks)
+                print("Running distributed execution...")
+                _, dist_time = self.run_distributed(agent_configs)
                 self.metrics.add_metric(
-                    dist_time, len(tasks), 'distributed',
+                    dist_time, len(agent_configs), 'distributed',
                     ray.runtime_context.get_runtime_context().get_memory_usage(),
                     ray.runtime_context.get_runtime_context().get_cpu_usage()
                 )
+                print(f"Distributed execution completed in {dist_time:.2f} seconds")
             except Exception as e:
-                print(f"Error in distributed execution: {e}")
+                print(f"Error in distributed execution: {str(e)}")
                 continue
         
         return self.metrics.to_dataframe()
 
 def run():
     """CLI entry point for running benchmarks"""
+    # Check for OpenAI API key
+    if not os.getenv('OPENAI_API_KEY'):
+        print("Error: OPENAI_API_KEY environment variable is not set.")
+        print("Please set your OpenAI API key first:")
+        print("export OPENAI_API_KEY='your-api-key-here'")
+        return
+        
     from .utils.metrics import MetricsCollector
     
     # Initialize benchmark and metrics collector
     benchmark = Benchmark()
     metrics_collector = MetricsCollector()
     
-    # Define benchmark configurations
+    # Define benchmark configurations with more specific agent parameters
     agent_configs = [
         {
             "role": "Researcher",
@@ -106,7 +155,7 @@ def run():
             "backstory": "Expert at finding and collecting information",
             "allow_delegation": True,
             "verbose": True,
-            "tools": []  # Add any specific tools your agents need
+            "max_iterations": 1  # Limit iterations for benchmarking
         },
         {
             "role": "Analyst",
@@ -114,7 +163,7 @@ def run():
             "backstory": "Skilled data analyst with attention to detail",
             "allow_delegation": True,
             "verbose": True,
-            "tools": []
+            "max_iterations": 1
         },
         {
             "role": "Writer",
@@ -122,35 +171,28 @@ def run():
             "backstory": "Experienced technical writer",
             "allow_delegation": True,
             "verbose": True,
-            "tools": []
+            "max_iterations": 1
         }
-    ]
-    
-    tasks = [
-        Task(
-            description="Gather market research data for tech sector",
-            expected_output="Comprehensive market data report",
-        ),
-        Task(
-            description="Analyze market trends and competition",
-            expected_output="Detailed analysis report",
-        ),
-        Task(
-            description="Create executive summary of findings",
-            expected_output="Executive summary document",
-        )
     ]
     
     # Run benchmarks with different configurations
     print("Running benchmarks...")
     
-    # Test with different numbers of iterations
+    # Start with a single iteration for testing
+    print("\nRunning initial test with 1 iteration...")
+    test_results = benchmark.compare_performance(agent_configs, iterations=1)
+    
+    if test_results.empty:
+        print("Initial test failed. Please check the configuration and try again.")
+        return
+        
+    # If initial test succeeds, run full benchmark
     iterations = [3, 5, 10]
-    all_results = pd.DataFrame()
+    all_results = test_results
     
     for n_iter in iterations:
         print(f"\nRunning benchmark with {n_iter} iterations...")
-        results_df = benchmark.compare_performance(agent_configs, tasks, iterations=n_iter)
+        results_df = benchmark.compare_performance(agent_configs, iterations=n_iter)
         if not results_df.empty:
             results_df['num_iterations'] = n_iter
             all_results = pd.concat([all_results, results_df])
