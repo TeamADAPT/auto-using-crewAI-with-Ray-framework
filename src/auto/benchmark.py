@@ -5,6 +5,11 @@ import os
 from typing import List, Dict, Tuple
 from crewai import Agent, Task, Crew
 from langchain_openai import ChatOpenAI
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class BenchmarkMetrics:
     def __init__(self):
@@ -13,16 +18,14 @@ class BenchmarkMetrics:
             'tasks_completed': [],
             'execution_type': [],
             'timestamp': [],
-            'cpu_percent': []  # Simplified metrics
+            'cpu_percent': []
         }
     
     def add_metric(self, exec_time: float, tasks: int, exec_type: str):
-        """Add metrics without trying to access unavailable memory data"""
         self.metrics['execution_time'].append(exec_time)
         self.metrics['tasks_completed'].append(tasks)
         self.metrics['execution_type'].append(exec_type)
         self.metrics['timestamp'].append(time.time())
-        # Get available CPU metrics from Ray
         try:
             resources = ray.available_resources()
             cpu_usage = 1.0 - (resources.get('CPU', 0) / ray.cluster_resources()['CPU'])
@@ -37,39 +40,46 @@ class BenchmarkMetrics:
 class RayAgent:
     """Ray Actor wrapper for CrewAI agents"""
     def __init__(self, agent_config: Dict):
-        # Configure OpenAI for distributed agent
+        # Initialize OpenAI client inside the Ray actor
         self.llm = ChatOpenAI(
-            model="gpt-3.5-turbo",
+            model=os.getenv('MODEL', 'gpt-4'),
             temperature=0.7,
             request_timeout=30,
             max_retries=3
         )
+        # Create agent with initialized LLM
         agent_config['llm'] = self.llm
         self.agent = Agent(**agent_config)
         
-    def execute_task(self, task: Task) -> str:
-        return self.agent.execute(task)
+    def execute_task(self, task_data: Dict) -> str:
+        """Execute task from serializable data"""
+        task = Task(
+            description=task_data['description'],
+            expected_output=task_data['expected_output']
+        )
+        logger.info(f"Executing task: {task.description}")
+        return self.agent.execute_task(task)
 
 class RayExecutor:
-    """Handles distributed execution of CrewAI workflows using Ray"""
-    
     def __init__(self):
         if not ray.is_initialized():
             ray.init()
             
     def create_agents(self, agent_configs: List[Dict]) -> List[RayAgent]:
-        """Create Ray agent actors from configurations"""
         return [RayAgent.remote(config) for config in agent_configs]
     
     def execute_tasks(self, agents: List[RayAgent], tasks: List[Task]) -> List[str]:
-        """Execute tasks in parallel using Ray"""
         futures = []
         for agent, task in zip(agents, tasks):
-            futures.append(agent.execute_task.remote(task))
+            # Convert task to serializable format
+            task_data = {
+                'description': task.description,
+                'expected_output': task.expected_output
+            }
+            futures.append(agent.execute_task.remote(task_data))
         return ray.get(futures)
     
     def shutdown(self):
-        """Clean up Ray resources"""
         if ray.is_initialized():
             ray.shutdown()
 
@@ -78,51 +88,45 @@ class Benchmark:
         self.metrics = BenchmarkMetrics()
         self.ray_executor = RayExecutor()
         
-        # Configure OpenAI LLM
+        # Initialize OpenAI LLM for sequential execution
         self.llm = ChatOpenAI(
-            model="gpt-3.5-turbo",
+            model=os.getenv('MODEL', 'gpt-4'),
             temperature=0.7,
             request_timeout=30,
             max_retries=3
         )
     
     def create_agents_and_tasks(self, agent_configs: List[Dict]) -> Tuple[List[Agent], List[Task]]:
-        """Create agents and tasks with proper assignments"""
-        # Add LLM configuration to each agent
         agents = []
         for config in agent_configs:
-            config['llm'] = self.llm  # Add LLM configuration
-            agents.append(Agent(**config))
+            config_copy = config.copy()  # Create a copy to avoid modifying original
+            config_copy['llm'] = self.llm
+            agents.append(Agent(**config_copy))
         
-        # Create tasks with assigned agents
         tasks = [
             Task(
                 description="Gather market research data for tech sector",
                 expected_output="Comprehensive market data report",
-                agent=agents[0]  # Assign to Researcher
+                agent=agents[0]
             ),
             Task(
                 description="Analyze market trends and competition",
                 expected_output="Detailed analysis report",
-                agent=agents[1]  # Assign to Analyst
+                agent=agents[1]
             ),
             Task(
                 description="Create executive summary of findings",
                 expected_output="Executive summary document",
-                agent=agents[2]  # Assign to Writer
+                agent=agents[2]
             )
         ]
         
         return agents, tasks
     
     def run_sequential(self, agent_configs: List[Dict]) -> Tuple[List[str], float]:
-        """Run tasks sequentially and measure performance"""
         start_time = time.time()
-        
-        # Create agents and tasks
         agents, tasks = self.create_agents_and_tasks(agent_configs)
         
-        # Create and run crew
         crew = Crew(
             agents=agents,
             tasks=tasks,
@@ -134,55 +138,48 @@ class Benchmark:
         return results, exec_time
     
     def run_distributed(self, agent_configs: List[Dict]) -> Tuple[List[str], float]:
-        """Run tasks in parallel using Ray"""
         start_time = time.time()
-        ray_agents = self.ray_executor.create_agents(agent_configs)
+        
+        # Create fresh agent configs without LLM
+        clean_configs = [{k: v for k, v in config.items() if k != 'llm'} 
+                        for config in agent_configs]
+        
+        ray_agents = self.ray_executor.create_agents(clean_configs)
         _, tasks = self.create_agents_and_tasks(agent_configs)
         results = self.ray_executor.execute_tasks(ray_agents, tasks)
         exec_time = time.time() - start_time
         return results, exec_time
     
     def compare_performance(self, agent_configs: List[Dict], iterations: int = 3):
-        """Compare sequential vs distributed performance"""
         for i in range(iterations):
-            print(f"\nIteration {i+1}/{iterations}")
+            logger.info(f"\nIteration {i+1}/{iterations}")
             
-            # Sequential execution
             try:
-                print("Running sequential execution...")
+                logger.info("Running sequential execution...")
                 _, seq_time = self.run_sequential(agent_configs)
-                self.metrics.add_metric(
-                    seq_time, 
-                    len(agent_configs), 
-                    'sequential'
-                )
-                print(f"Sequential execution completed in {seq_time:.2f} seconds")
+                self.metrics.add_metric(seq_time, len(agent_configs), 'sequential')
+                logger.info(f"Sequential execution completed in {seq_time:.2f} seconds")
             except Exception as e:
-                print(f"Error in sequential execution: {str(e)}")
+                logger.error(f"Error in sequential execution: {str(e)}")
                 continue
                 
-            # Distributed execution
             try:
-                print("Running distributed execution...")
+                logger.info("Running distributed execution...")
                 _, dist_time = self.run_distributed(agent_configs)
-                self.metrics.add_metric(
-                    dist_time, 
-                    len(agent_configs), 
-                    'distributed'
-                )
-                print(f"Distributed execution completed in {dist_time:.2f} seconds")
+                self.metrics.add_metric(dist_time, len(agent_configs), 'distributed')
+                logger.info(f"Distributed execution completed in {dist_time:.2f} seconds")
             except Exception as e:
-                print(f"Error in distributed execution: {str(e)}")
+                logger.error(f"Error in distributed execution: {str(e)}")
                 continue
         
         return self.metrics.to_dataframe()
 
 def run():
     """CLI entry point for running benchmarks"""
-    # Initialize benchmark and metrics collector
+    # Initialize benchmark
     benchmark = Benchmark()
     
-    # Define benchmark configurations with more specific agent parameters
+    # Agent configurations
     agent_configs = [
         {
             "role": "Researcher",
@@ -190,7 +187,7 @@ def run():
             "backstory": "Expert at finding and collecting information",
             "allow_delegation": True,
             "verbose": True,
-            "max_iterations": 1  # Limit iterations for benchmarking
+            "max_iterations": 1
         },
         {
             "role": "Analyst",
@@ -210,50 +207,50 @@ def run():
         }
     ]
     
-    # Run benchmarks with different configurations
-    print("Running benchmarks...")
+    logger.info("Running benchmarks...")
     
-    # Start with a single iteration for testing
-    print("\nRunning initial test with 1 iteration...")
+    # Initial test
+    logger.info("\nRunning initial test with 1 iteration...")
     test_results = benchmark.compare_performance(agent_configs, iterations=1)
     
     if test_results.empty:
-        print("Initial test failed. Please check the configuration and try again.")
+        logger.error("Initial test failed. Please check the configuration and try again.")
         return
         
-    # If initial test succeeds, run full benchmark
+    # Full benchmark
     iterations = [3, 5, 10]
     all_results = test_results
     
     for n_iter in iterations:
-        print(f"\nRunning benchmark with {n_iter} iterations...")
+        logger.info(f"\nRunning benchmark with {n_iter} iterations...")
         results_df = benchmark.compare_performance(agent_configs, iterations=n_iter)
         if not results_df.empty:
             results_df['num_iterations'] = n_iter
             all_results = pd.concat([all_results, results_df])
     
     if all_results.empty:
-        print("No successful benchmark runs completed.")
+        logger.error("No successful benchmark runs completed.")
         return
         
-    # Calculate and print summary statistics
+    # Calculate statistics
     sequential_times = all_results[all_results['execution_type'] == 'sequential']['execution_time']
     distributed_times = all_results[all_results['execution_type'] == 'distributed']['execution_time']
     
-    print("\nBenchmark Results Summary:")
-    print("-" * 50)
-    print("\nExecution Times (seconds):")
-    print(f"Sequential  - Mean: {sequential_times.mean():.2f}, Min: {sequential_times.min():.2f}, Max: {sequential_times.max():.2f}")
-    print(f"Distributed - Mean: {distributed_times.mean():.2f}, Min: {distributed_times.min():.2f}, Max: {distributed_times.max():.2f}")
+    logger.info("\nBenchmark Results Summary:")
+    logger.info("-" * 50)
+    logger.info("\nExecution Times (seconds):")
+    logger.info(f"Sequential  - Mean: {sequential_times.mean():.2f}, Min: {sequential_times.min():.2f}, Max: {sequential_times.max():.2f}")
     
-    speedup = sequential_times.mean() / distributed_times.mean()
-    print(f"\nAverage Speedup: {speedup:.2f}x")
+    if not distributed_times.empty:
+        logger.info(f"Distributed - Mean: {distributed_times.mean():.2f}, Min: {distributed_times.min():.2f}, Max: {distributed_times.max():.2f}")
+        speedup = sequential_times.mean() / distributed_times.mean()
+        logger.info(f"\nAverage Speedup: {speedup:.2f}x")
     
-    # Save results to CSV
+    # Save results
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     results_file = f"benchmark_results_{timestamp}.csv"
     all_results.to_csv(results_file, index=False)
-    print(f"\nDetailed results saved to: {results_file}")
+    logger.info(f"\nDetailed results saved to: {results_file}")
 
 if __name__ == "__main__":
     run()
